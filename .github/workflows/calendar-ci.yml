@@ -1,0 +1,457 @@
+name: CI/CD for Calendar Service
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "calendar/**"
+      - ".github/workflows/calendar-ci.yml"
+      - "nomad/calendar.hcl"
+      - "docker/Dockerfile.stage"
+
+env:
+  IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
+  DOCKER_IMAGE: friendy21/calendar-service
+  SERVICE_NAME: calendar-service
+  SERVICE_PORT: 5002
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./calendar
+        file: ./docker/Dockerfile.stage
+        push: true
+        tags: |
+          ${{ env.DOCKER_IMAGE }}:latest
+          ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Run security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+        format: 'table'
+        exit-code: '0'
+        severity: 'CRITICAL,HIGH'
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Validate required secrets
+      run: |
+        if [ -z "${{ secrets.NOMAD_ADDR }}" ]; then
+          echo "❌ NOMAD_ADDR secret is not set"
+          echo "Please configure NOMAD_ADDR in GitHub Secrets with format:"
+          echo "  - For HTTP: http://your-nomad-server:4646"
+          echo "  - For HTTPS: https://your-nomad-server:4646"
+          exit 1
+        fi
+        
+        # Parse and validate NOMAD_ADDR format
+        NOMAD_URL="${{ secrets.NOMAD_ADDR }}"
+        if [[ ! "$NOMAD_URL" =~ ^https?:// ]]; then
+          echo "❌ NOMAD_ADDR must start with http:// or https://"
+          echo "Current value appears to be missing protocol"
+          exit 1
+        fi
+        
+        echo "✅ NOMAD_ADDR is configured: ${NOMAD_URL%%://*}://[REDACTED]"
+        
+        if [ -z "${{ secrets.NOMAD_TOKEN }}" ]; then
+          echo "⚠️ NOMAD_TOKEN is not set - will attempt connection without authentication"
+          echo "If your Nomad cluster requires authentication, please set NOMAD_TOKEN secret"
+        else
+          echo "✅ NOMAD_TOKEN is configured"
+        fi
+      
+    - name: Setup Nomad CLI
+      run: |
+        # Install specific version of Nomad for compatibility
+        NOMAD_VERSION="1.8.3"
+        echo "📦 Installing Nomad CLI version ${NOMAD_VERSION}..."
+        
+        curl -fsSL -o nomad.zip \
+          https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_amd64.zip
+        
+        if [ ! -f nomad.zip ]; then
+          echo "❌ Failed to download Nomad CLI"
+          exit 1
+        fi
+        
+        sudo unzip -o nomad.zip -d /usr/local/bin/
+        sudo chmod +x /usr/local/bin/nomad
+        rm nomad.zip
+        
+        # Verify installation
+        if ! command -v nomad &> /dev/null; then
+          echo "❌ Nomad CLI installation failed"
+          exit 1
+        fi
+        
+        nomad version
+        echo "✅ Nomad CLI installed successfully"
+
+    - name: Test Nomad connectivity
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+        NOMAD_SKIP_VERIFY: true  # Skip TLS verification if using self-signed certs
+      run: |
+        echo "🔍 Testing connection to Nomad server..."
+        echo "Server: ${NOMAD_ADDR%%/v1*}"  # Remove any /v1 suffix if present
+        
+        # First, test basic network connectivity
+        NOMAD_HOST=$(echo "$NOMAD_ADDR" | sed -E 's|https?://||' | cut -d'/' -f1 | cut -d':' -f1)
+        NOMAD_PORT=$(echo "$NOMAD_ADDR" | sed -E 's|https?://||' | cut -d'/' -f1 | cut -d':' -f2)
+        
+        # Default port if not specified
+        if [ "$NOMAD_PORT" = "$NOMAD_HOST" ]; then
+          if [[ "$NOMAD_ADDR" =~ ^https:// ]]; then
+            NOMAD_PORT=4646
+          else
+            NOMAD_PORT=4646
+          fi
+        fi
+        
+        echo "📡 Testing network connectivity to ${NOMAD_HOST}:${NOMAD_PORT}..."
+        
+        # Test with timeout
+        if ! timeout 10 bash -c "echo > /dev/tcp/${NOMAD_HOST}/${NOMAD_PORT}" 2>/dev/null; then
+          echo "❌ Cannot establish network connection to Nomad server"
+          echo ""
+          echo "Troubleshooting steps:"
+          echo "1. Verify Nomad server is running: systemctl status nomad (on server)"
+          echo "2. Check firewall rules allow port ${NOMAD_PORT}"
+          echo "3. If Nomad is behind a proxy/load balancer, ensure it's configured correctly"
+          echo "4. Verify NOMAD_ADDR secret is correct: ${NOMAD_ADDR%%://*}://your-server:4646"
+          echo "5. Check if Nomad requires HTTPS instead of HTTP (or vice versa)"
+          echo ""
+          echo "Common issues:"
+          echo "- AWS/Cloud: Security group not allowing inbound traffic on port ${NOMAD_PORT}"
+          echo "- Docker: Nomad container not exposing port ${NOMAD_PORT}"
+          echo "- Firewall: ufw/iptables blocking port ${NOMAD_PORT}"
+          exit 1
+        fi
+        
+        echo "✅ Network connectivity established"
+        
+        # Now test Nomad API
+        echo "🔍 Testing Nomad API endpoint..."
+        
+        # Try different endpoints to diagnose the issue
+        if command -v curl &> /dev/null; then
+          echo "Using curl for detailed diagnostics..."
+          
+          # Test the leader endpoint (usually doesn't require auth)
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            ${NOMAD_TOKEN:+-H "X-Nomad-Token: ${NOMAD_TOKEN}"} \
+            "${NOMAD_ADDR}/v1/status/leader" || echo "000")
+          
+          case $HTTP_CODE in
+            200)
+              echo "✅ Successfully connected to Nomad API"
+              ;;
+            401|403)
+              echo "❌ Authentication failed (HTTP ${HTTP_CODE})"
+              echo "Please ensure NOMAD_TOKEN is set correctly in GitHub Secrets"
+              exit 1
+              ;;
+            404)
+              echo "❌ Nomad API endpoint not found (HTTP 404)"
+              echo "Please verify NOMAD_ADDR format. Should be: http(s)://server:4646"
+              exit 1
+              ;;
+            000)
+              echo "❌ Connection failed - timeout or network error"
+              echo "The server may be using HTTPS with self-signed certificates."
+              echo "Trying with --insecure flag..."
+              
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --insecure \
+                ${NOMAD_TOKEN:+-H "X-Nomad-Token: ${NOMAD_TOKEN}"} \
+                "${NOMAD_ADDR}/v1/status/leader" || echo "000")
+              
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "✅ Connected successfully with TLS verification disabled"
+                export NOMAD_SKIP_VERIFY=true
+              else
+                echo "Still failing. Server might be down or unreachable."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "⚠️ Unexpected HTTP response code: ${HTTP_CODE}"
+              echo "Attempting to continue..."
+              ;;
+          esac
+        fi
+        
+        # Try using Nomad CLI
+        echo "🔍 Testing Nomad CLI connection..."
+        if nomad status -timeout=30s 2>&1 | grep -q "Error"; then
+          echo "❌ Nomad CLI cannot connect to server"
+          nomad status -timeout=30s 2>&1 || true
+          exit 1
+        else
+          echo "✅ Nomad CLI successfully connected"
+          echo "📊 Cluster status:"
+          nomad server members 2>/dev/null || echo "Cannot retrieve server members (may require authentication)"
+        fi
+
+    - name: Prepare Nomad job file
+      run: |
+        echo "📝 Preparing Nomad job file..."
+        
+        # Backup original
+        cp nomad/calendar.hcl nomad/calendar.hcl.backup
+        
+        # Replace placeholders
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/calendar.hcl
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/calendar.hcl
+        
+        echo "✅ Job file prepared with:"
+        echo "  - Image: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}"
+        echo "  - Service: ${{ env.SERVICE_NAME }}"
+        
+        # Show first few lines for verification
+        echo "📄 Job file preview:"
+        head -20 nomad/calendar.hcl
+
+    - name: Validate Nomad job
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+        NOMAD_SKIP_VERIFY: true
+      run: |
+        echo "🔍 Validating Nomad job specification..."
+        
+        if ! nomad job validate nomad/calendar.hcl; then
+          echo "❌ Job validation failed"
+          echo "Job file contents:"
+          cat nomad/calendar.hcl
+          exit 1
+        fi
+        
+        echo "✅ Job specification is valid"
+
+    - name: Deploy to Nomad
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+        NOMAD_SKIP_VERIFY: true
+      run: |
+        echo "🚀 Deploying ${SERVICE_NAME} to Nomad..."
+        
+        # Check if job already exists and stop it if in bad state
+        if nomad job status ${SERVICE_NAME} &>/dev/null; then
+          JOB_STATUS=$(nomad job status ${SERVICE_NAME} | grep "^Status" | awk '{print $3}')
+          echo "📊 Existing job status: ${JOB_STATUS}"
+          
+          if [ "$JOB_STATUS" = "dead" ] || [ "$JOB_STATUS" = "failed" ]; then
+            echo "🧹 Cleaning up previous failed deployment..."
+            nomad job stop -purge ${SERVICE_NAME} || true
+            sleep 5
+          fi
+        fi
+        
+        # Run the job with detailed output
+        echo "📤 Submitting job to Nomad..."
+        if ! nomad job run -verbose nomad/calendar.hcl; then
+          echo "❌ Job submission failed"
+          echo ""
+          echo "Attempting to get more information..."
+          nomad job plan nomad/calendar.hcl 2>&1 || true
+          exit 1
+        fi
+        
+        echo "✅ Job submitted successfully"
+        
+        # Get the evaluation ID
+        EVAL_ID=$(nomad job status ${SERVICE_NAME} | grep -A1 "ID.*Type.*Priority.*Status" | tail -1 | awk '{print $1}')
+        if [ -n "$EVAL_ID" ]; then
+          echo "📋 Evaluation ID: ${EVAL_ID}"
+        fi
+
+    - name: Wait for deployment
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+        NOMAD_SKIP_VERIFY: true
+      run: |
+        echo "⏳ Waiting for deployment to complete..."
+        
+        MAX_WAIT=300
+        ELAPSED=0
+        CHECK_INTERVAL=10
+        
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          # Get job status
+          if ! JOB_OUTPUT=$(nomad job status ${SERVICE_NAME} 2>&1); then
+            echo "⚠️ Cannot get job status (attempt $((ELAPSED/CHECK_INTERVAL + 1)))"
+            sleep $CHECK_INTERVAL
+            ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+            continue
+          fi
+          
+          # Parse status
+          STATUS=$(echo "$JOB_OUTPUT" | grep "^Status" | awk '{print $3}')
+          
+          echo "⏱️ [${ELAPSED}s/${MAX_WAIT}s] Current status: ${STATUS:-unknown}"
+          
+          case "$STATUS" in
+            running)
+              echo "✅ Service is running!"
+              
+              # Get allocation details
+              echo "📊 Allocation status:"
+              nomad job allocs ${SERVICE_NAME} | head -10 || true
+              
+              # Try to get the running allocation ID
+              ALLOC_ID=$(nomad job allocs ${SERVICE_NAME} | grep "running" | head -1 | awk '{print $1}')
+              if [ -n "$ALLOC_ID" ]; then
+                echo "📋 Running allocation: ${ALLOC_ID}"
+                
+                # Get allocation details
+                echo "📝 Allocation details:"
+                nomad alloc status -short $ALLOC_ID 2>/dev/null | head -20 || true
+              fi
+              
+              echo "🎉 ${SERVICE_NAME} deployed successfully!"
+              exit 0
+              ;;
+            
+            pending|blocked)
+              echo "⏳ Job is ${STATUS}, waiting for resources..."
+              
+              # Check for common issues
+              if echo "$JOB_OUTPUT" | grep -q "Resources exhausted"; then
+                echo "⚠️ Warning: Cluster resources may be exhausted"
+              fi
+              ;;
+            
+            dead|failed)
+              echo "❌ Deployment failed with status: ${STATUS}"
+              
+              # Get failure details
+              echo "📋 Failure details:"
+              nomad job status ${SERVICE_NAME} || true
+              
+              echo ""
+              echo "📊 Recent allocations:"
+              nomad job allocs ${SERVICE_NAME} | head -10 || true
+              
+              # Try to get logs from failed allocation
+              FAILED_ALLOC=$(nomad job allocs ${SERVICE_NAME} | grep -E "failed|complete" | head -1 | awk '{print $1}')
+              if [ -n "$FAILED_ALLOC" ]; then
+                echo ""
+                echo "📄 Failed allocation logs:"
+                nomad alloc logs $FAILED_ALLOC 2>&1 | tail -50 || true
+              fi
+              
+              exit 1
+              ;;
+            
+            *)
+              if [ -z "$STATUS" ]; then
+                echo "⚠️ Cannot determine job status"
+              else
+                echo "❓ Unknown status: ${STATUS}"
+              fi
+              ;;
+          esac
+          
+          sleep $CHECK_INTERVAL
+          ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+        done
+        
+        echo "❌ Deployment timed out after ${MAX_WAIT} seconds"
+        echo "Final job status:"
+        nomad job status ${SERVICE_NAME} || true
+        exit 1
+
+    - name: Verify deployment health
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+        NOMAD_SKIP_VERIFY: true
+      run: |
+        echo "🏥 Verifying service health..."
+        
+        # Get service information from Consul if available
+        if [ -n "${{ secrets.CONSUL_ADDR }}" ]; then
+          echo "🔍 Checking Consul service registration..."
+          curl -s "${{ secrets.CONSUL_ADDR }}/v1/health/service/${SERVICE_NAME}" | jq '.[0].Checks' 2>/dev/null || echo "Consul not accessible or service not registered"
+        fi
+        
+        echo "✅ Deployment verification complete"
+        echo ""
+        echo "📊 Summary:"
+        echo "  - Service: ${SERVICE_NAME}"
+        echo "  - Image: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}"
+        echo "  - Port: ${{ env.SERVICE_PORT }}"
+        echo "  - Status: Deployed successfully"
+
+  rollback:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: failure() && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Rollback on failure
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+        NOMAD_SKIP_VERIFY: true
+      run: |
+        echo "🔄 Attempting rollback..."
+        
+        # Install Nomad CLI
+        NOMAD_VERSION="1.8.3"
+        curl -fsSL -o nomad.zip \
+          https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_amd64.zip
+        sudo unzip -o nomad.zip -d /usr/local/bin/
+        rm nomad.zip
+        
+        # Attempt to revert to previous version
+        if nomad job revert ${SERVICE_NAME} 0 2>/dev/null; then
+          echo "✅ Successfully reverted to previous version"
+        else
+          echo "⚠️ Could not revert (might be first deployment)"
+          
+          # Stop the failed job
+          nomad job stop ${SERVICE_NAME} 2>/dev/null || true
+        fi
+        
+        echo "🧹 Rollback process completed"
