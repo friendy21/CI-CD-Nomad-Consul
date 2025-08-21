@@ -1,0 +1,19 @@
+{
+  "service": {
+    "name": "calendar-service",
+    "port": 5002,
+    "tags": ["api", "backend", "v1"],
+    "meta": {
+      "version": "1.0.0",
+      "protocol": "http"
+    },
+    "check": {
+      "id": "calendar-service-health",
+      "name": "Calendar Service Health Check",
+      "http": "http://localhost:5002/health",
+      "method": "GET",
+      "interval": "30s",
+      "timeout": "5s"
+    }
+  }
+}
