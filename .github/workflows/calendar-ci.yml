@@ -8,6 +8,12 @@ on:
       - ".github/workflows/calendar-ci.yml"
       - "nomad/calendar.hcl"
       - "docker/Dockerfile.stage"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "calendar/**"
+      - ".github/workflows/calendar-ci.yml"
+      - "nomad/calendar.hcl"
 
 env:
   IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
@@ -18,6 +24,7 @@ env:
 permissions:
   contents: read
   packages: write
+  security-events: write
 
 jobs:
   build:
@@ -35,6 +42,16 @@ jobs:
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_IMAGE }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
         
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
@@ -42,14 +59,26 @@ jobs:
         context: ./calendar
         file: ./docker/Dockerfile.stage
         push: true
-        tags: |
-          ${{ env.DOCKER_IMAGE }}:latest
-          ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
         build-args: |
           BUILD_DATE=${{ github.event.head_commit.timestamp }}
           VERSION=${{ env.IMAGE_TAG }}
+
+    - name: Run security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_IMAGE }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
 
   deploy:
     runs-on: ubuntu-latest
@@ -60,6 +89,18 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       
+    - name: Setup Nomad
+      uses: hashicorp/setup-nomad@main
+      with:
+        nomad_version: 'latest'
+
+    - name: Verify Nomad installation
+      run: |
+        echo "✅ Nomad version:"
+        nomad version
+        echo "✅ Nomad path:"
+        which nomad
+
     - name: Debug repository structure
       run: |
         echo "🔍 Debugging repository structure..."
@@ -77,54 +118,13 @@ jobs:
         else
           echo "❌ nomad directory not found"
         fi
-        echo ""
-        echo "📁 Checking docker directory:"
-        if [ -d docker ]; then
-          echo "✅ docker directory exists"
-          ls -la docker/
-        else
-          echo "❌ docker directory not found"
-        fi
-      
-    - name: Setup Nomad
-      run: |
-        # Clean up any existing nomad files/directories
-        sudo rm -rf /usr/local/bin/nomad 2>/dev/null || true
-        sudo rm -rf nomad_temp 2>/dev/null || true
-        rm -f nomad.zip LICENSE.txt 2>/dev/null || true
-        
-        # Download Nomad
-        echo "📥 Downloading Nomad 1.8.3..."
-        if ! curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip; then
-          echo "❌ Failed to download Nomad"
-          exit 1
-        fi
-        
-        # Extract with overwrite flag
-        echo "📦 Extracting Nomad..."
-        if ! unzip -o nomad.zip; then
-          echo "❌ Failed to extract Nomad"
-          exit 1
-        fi
-        
-        # Move the binary to /usr/local/bin
-        chmod +x nomad
-        sudo mv nomad /usr/local/bin/nomad
-        
-        # Clean up
-        rm -f nomad.zip LICENSE.txt
-        
-        # Verify installation
-        echo "✅ Nomad installation verified:"
-        which nomad
-        nomad version
 
     - name: Validate and Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        set -e  # Exit on any error
+        set -e
         
         echo "🔍 Validating environment..."
         
@@ -164,51 +164,75 @@ jobs:
           echo "✅ Found HCL file at expected location: $HCL_FILE"
         fi
         
-        # Create backup
-        cp "$HCL_FILE" "${HCL_FILE}.backup"
-        echo "💾 Created backup: ${HCL_FILE}.backup"
+        # Create backup with timestamp
+        BACKUP_FILE="${HCL_FILE}.backup.$(date +%s)"
+        cp "$HCL_FILE" "$BACKUP_FILE"
+        echo "💾 Created backup: $BACKUP_FILE"
         
         # Show original content for debugging
-        echo "📄 Original HCL file content:"
+        echo "📄 Original HCL file content (first 20 lines):"
         echo "----------------------------------------"
-        cat "$HCL_FILE"
+        head -20 "$HCL_FILE"
         echo "----------------------------------------"
         
-        # Replace placeholders
+        # Replace placeholders with better error handling
         echo "🔄 Replacing placeholders..."
-        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" "$HCL_FILE"
-        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" "$HCL_FILE"
+        if ! sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" "$HCL_FILE"; then
+          echo "❌ Failed to replace IMAGE_TAG_PLACEHOLDER"
+          exit 1
+        fi
         
-        # Verify replacements
+        if ! sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" "$HCL_FILE"; then
+          echo "❌ Failed to replace DOCKER_IMAGE_PLACEHOLDER"
+          exit 1
+        fi
+        
+        # Verify replacements more thoroughly
         echo "🔍 Checking for remaining placeholders..."
-        if grep -q "PLACEHOLDER" "$HCL_FILE"; then
-          echo "❌ Placeholder replacement failed. Remaining placeholders:"
+        REMAINING_PLACEHOLDERS=$(grep -c "PLACEHOLDER" "$HCL_FILE" || echo "0")
+        if [ "$REMAINING_PLACEHOLDERS" -gt 0 ]; then
+          echo "❌ Found $REMAINING_PLACEHOLDERS remaining placeholders:"
           grep "PLACEHOLDER" "$HCL_FILE" || true
           echo ""
           echo "📄 Current file content:"
           echo "----------------------------------------"
           cat "$HCL_FILE"
           echo "----------------------------------------"
+          echo "🔄 Restoring from backup..."
+          cp "$BACKUP_FILE" "$HCL_FILE"
           exit 1
         fi
         
         echo "✅ Placeholders replaced successfully"
         
         # Show final content for verification
-        echo "📄 Final HCL file content:"
+        echo "📄 Final HCL file content (image line):"
         echo "----------------------------------------"
-        cat "$HCL_FILE"
+        grep -n "image.*=" "$HCL_FILE" || echo "No image line found"
         echo "----------------------------------------"
         
-        # Test Nomad connectivity
+        # Test Nomad connectivity with retry logic
         echo "🔗 Testing Nomad connectivity..."
-        if ! nomad node status >/dev/null 2>&1; then
-          echo "❌ Cannot connect to Nomad at $NOMAD_ADDR"
-          echo "🔍 Nomad server info:"
-          curl -s "$NOMAD_ADDR/v1/status/leader" || echo "Failed to get leader info"
-          exit 1
-        fi
-        echo "✅ Nomad connectivity verified"
+        MAX_CONN_ATTEMPTS=5
+        CONN_ATTEMPT=0
+        
+        while [ $CONN_ATTEMPT -lt $MAX_CONN_ATTEMPTS ]; do
+          if nomad node status >/dev/null 2>&1; then
+            echo "✅ Nomad connectivity verified"
+            break
+          fi
+          
+          CONN_ATTEMPT=$((CONN_ATTEMPT + 1))
+          if [ $CONN_ATTEMPT -lt $MAX_CONN_ATTEMPTS ]; then
+            echo "⏳ Connection attempt $CONN_ATTEMPT/$MAX_CONN_ATTEMPTS failed, retrying in 10s..."
+            sleep 10
+          else
+            echo "❌ Cannot connect to Nomad at $NOMAD_ADDR after $MAX_CONN_ATTEMPTS attempts"
+            echo "🔍 Nomad server info:"
+            curl -s "$NOMAD_ADDR/v1/status/leader" || echo "Failed to get leader info"
+            exit 1
+          fi
+        done
         
         # Validate job
         echo "🔍 Validating Nomad job..."
@@ -220,6 +244,14 @@ jobs:
         fi
         echo "✅ Job validation passed"
         
+        # Plan the job (dry run)
+        echo "📋 Planning job deployment..."
+        if ! nomad job plan "$HCL_FILE"; then
+          echo "⚠️ Job planning failed, but continuing with deployment..."
+        else
+          echo "✅ Job planning completed"
+        fi
+        
         # Run the job
         echo "🚀 Deploying calendar-service..."
         if ! nomad job run "$HCL_FILE"; then
@@ -229,45 +261,75 @@ jobs:
         fi
         echo "✅ Job submitted successfully"
         
-        # Wait for deployment with improved monitoring
+        # Enhanced deployment monitoring
         echo "⏳ Waiting for deployment to complete..."
-        MAX_ATTEMPTS=60  # Increased from 30
+        MAX_ATTEMPTS=120  # Increased timeout to 20 minutes
         ATTEMPT=0
         LAST_STATUS=""
+        STABLE_COUNT=0
         
         while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          # Get job status with error handling
-          STATUS=$(nomad job status calendar-service 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "unknown")
+          # Get job status with better error handling
+          STATUS=$(nomad job status calendar-service 2>/dev/null | grep "^Status" | awk '{print $3}' 2>/dev/null || echo "unknown")
           
           # Only log status changes to reduce noise
           if [ "$STATUS" != "$LAST_STATUS" ]; then
             echo "📊 Status update ($((ATTEMPT + 1))/$MAX_ATTEMPTS): $STATUS"
             LAST_STATUS="$STATUS"
+            STABLE_COUNT=0
           fi
           
           case "$STATUS" in
             "running")
-              echo "✅ Calendar service is running!"
+              STABLE_COUNT=$((STABLE_COUNT + 1))
               
-              # Get allocation info
-              echo "📊 Deployment summary:"
-              nomad job status calendar-service | head -20
-              
-              # Optional: Test health endpoint
-              echo "🏥 Testing health endpoint (will retry if not ready)..."
-              for health_attempt in {1..5}; do
-                if curl -f -s "http://localhost:${{ env.SERVICE_PORT }}/health" >/dev/null 2>&1; then
-                  echo "✅ Health check passed"
-                  break
-                elif [ $health_attempt -eq 5 ]; then
+              # Wait for stable running state
+              if [ $STABLE_COUNT -ge 3 ]; then
+                echo "✅ Calendar service is running stably!"
+                
+                # Get deployment summary
+                echo "📊 Deployment summary:"
+                nomad job status calendar-service | head -20
+                
+                # Enhanced health check with proper networking
+                echo "🏥 Testing service health..."
+                
+                # Get allocation info first
+                ALLOC_ID=$(nomad job allocs calendar-service -json 2>/dev/null | jq -r '.[0].ID' 2>/dev/null || echo "")
+                
+                if [ -n "$ALLOC_ID" ] && [ "$ALLOC_ID" != "null" ]; then
+                  # Get the actual IP address of the allocation
+                  ALLOC_IP=$(nomad alloc status "$ALLOC_ID" 2>/dev/null | grep -E "Host Network.*:" | awk -F':' '{print $2}' | tr -d ' ' || echo "localhost")
+                  
+                  for health_attempt in {1..10}; do
+                    echo "🔄 Health check attempt $health_attempt/10..."
+                    
+                    # Try multiple health check methods
+                    for health_url in "http://${ALLOC_IP}:${{ env.SERVICE_PORT }}/health" "http://localhost:${{ env.SERVICE_PORT }}/health"; do
+                      if timeout 10 curl -f -s "$health_url" >/dev/null 2>&1; then
+                        echo "✅ Health check passed via $health_url"
+                        
+                        # Get detailed health info
+                        HEALTH_INFO=$(timeout 5 curl -s "$health_url" 2>/dev/null | jq . 2>/dev/null || echo "Health endpoint responded")
+                        echo "📊 Service health: $HEALTH_INFO"
+                        
+                        exit 0
+                      fi
+                    done
+                    
+                    if [ $health_attempt -lt 10 ]; then
+                      sleep 15
+                    fi
+                  done
+                  
                   echo "⚠️ Health check failed, but service is running"
+                  echo "🔍 This might be normal if the service is still initializing"
                 else
-                  echo "🔄 Health check attempt $health_attempt/5..."
-                  sleep 10
+                  echo "⚠️ Could not get allocation ID for health check"
                 fi
-              done
-              
-              exit 0
+                
+                exit 0
+              fi
               ;;
             "dead"|"failed")
               echo "❌ Deployment failed with status: $STATUS"
@@ -276,13 +338,19 @@ jobs:
               echo ""
               echo "📋 Recent allocations:"
               nomad job allocs calendar-service || true
+              echo ""
+              echo "📝 Recent logs:"
+              FAILED_ALLOC_ID=$(nomad job allocs calendar-service -json 2>/dev/null | jq -r '.[0].ID' 2>/dev/null || echo "")
+              if [ -n "$FAILED_ALLOC_ID" ] && [ "$FAILED_ALLOC_ID" != "null" ]; then
+                nomad alloc logs -n 50 "$FAILED_ALLOC_ID" 2>/dev/null || echo "No logs available"
+              fi
               exit 1
               ;;
             "pending")
-              # Only show detailed info every 10 attempts to reduce noise
-              if [ $((ATTEMPT % 10)) -eq 0 ] && [ $ATTEMPT -gt 0 ]; then
+              # Show detailed info every 20 attempts to reduce noise
+              if [ $((ATTEMPT % 20)) -eq 0 ] && [ $ATTEMPT -gt 0 ]; then
                 echo "📊 Still pending after $((ATTEMPT * 10)) seconds..."
-                nomad job status calendar-service | head -10 || true
+                nomad job status calendar-service | head -15 || true
               fi
               ;;
           esac
