@@ -8,6 +8,12 @@ on:
       - ".github/workflows/outlook-ci.yml"
       - "nomad/outlook.hcl"
       - "docker/Dockerfile.stage"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "outlook/**"
+      - ".github/workflows/outlook-ci.yml"
+      - "nomad/outlook.hcl"
 
 env:
   IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
@@ -18,6 +24,7 @@ env:
 permissions:
   contents: read
   packages: write
+  security-events: write
 
 jobs:
   build:
@@ -35,6 +42,16 @@ jobs:
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_IMAGE }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
         
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
@@ -42,11 +59,26 @@ jobs:
         context: ./outlook
         file: ./docker/Dockerfile.stage
         push: true
-        tags: |
-          ${{ env.DOCKER_IMAGE }}:latest
-          ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VERSION=${{ env.IMAGE_TAG }}
+
+    - name: Run security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_IMAGE }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
 
   deploy:
     runs-on: ubuntu-latest
@@ -58,72 +90,163 @@ jobs:
       uses: actions/checkout@v4
       
     - name: Setup Nomad
-      run: |
-        # Clean up any existing nomad files/directories
-        sudo rm -rf /usr/local/bin/nomad
-        sudo rm -rf nomad
-        rm -f nomad.zip LICENSE.txt
-        
-        # Download Nomad
-        curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip
-        
-        # Extract with overwrite flag
-        unzip -o nomad.zip
-        
-        # Move the binary to /usr/local/bin
-        chmod +x nomad
-        sudo mv nomad /usr/local/bin/nomad
-        
-        # Clean up
-        rm -f nomad.zip LICENSE.txt
-        
-        # Verify installation
-        which nomad
-        nomad version
+      uses: hashicorp/setup-nomad@main
+      with:
+        nomad_version: 'latest'
 
-    - name: Deploy to Nomad
+    - name: Verify Nomad installation
+      run: |
+        echo "✅ Nomad version:"
+        nomad version
+        echo "✅ Nomad path:"
+        which nomad
+
+    - name: Validate and Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        # Replace placeholders
-        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/outlook.hcl
-        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/outlook.hcl
+        set -e
         
-        # Validate job
-        if ! nomad job validate nomad/outlook.hcl; then
-          echo "❌ Job validation failed"
-          cat nomad/outlook.hcl
+        echo "🔍 Validating environment for ${{ env.SERVICE_NAME }}..."
+        
+        # Validate environment variables
+        if [ -z "$NOMAD_ADDR" ] || [ -z "$NOMAD_TOKEN" ]; then
+          echo "❌ Required environment variables not set"
           exit 1
         fi
         
-        # Run the job
-        echo "🚀 Deploying outlook-service..."
-        nomad job run nomad/outlook.hcl
+        echo "✅ Environment validated"
+        echo "🎯 Target: $NOMAD_ADDR"
+        echo "🔧 Image: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}"
         
-        # Wait for deployment
-        echo "⏳ Waiting for deployment..."
-        MAX_ATTEMPTS=30
-        ATTEMPT=0
-        
-        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          STATUS=$(nomad job status outlook-service 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "pending")
-          echo "Status check $((ATTEMPT + 1))/$MAX_ATTEMPTS: $STATUS"
-          
-          if [ "$STATUS" = "running" ]; then
-            echo "✅ Outlook service is running!"
-            nomad job status outlook-service
-            exit 0
-          elif [ "$STATUS" = "dead" ] || [ "$STATUS" = "failed" ]; then
-            echo "❌ Deployment failed with status: $STATUS"
-            nomad job status outlook-service
+        # Find and process HCL file
+        HCL_FILE="nomad/outlook.hcl"
+        if [ ! -f "$HCL_FILE" ]; then
+          HCL_FILE=$(find . -name "outlook.hcl" -type f | head -1)
+          if [ -z "$HCL_FILE" ]; then
+            echo "❌ outlook.hcl not found anywhere"
+            find . -name "*.hcl" -type f || echo "No HCL files found"
             exit 1
           fi
+        fi
+        echo "✅ Using HCL: $HCL_FILE"
+        
+        # Backup and replace placeholders
+        cp "$HCL_FILE" "${HCL_FILE}.backup"
+        echo "💾 Backup created"
+        
+        echo "🔄 Processing placeholders..."
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" "$HCL_FILE"
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" "$HCL_FILE"
+        
+        # Verify processing
+        if grep -q "PLACEHOLDER" "$HCL_FILE"; then
+          echo "❌ Unprocessed placeholders found:"
+          grep "PLACEHOLDER" "$HCL_FILE"
+          exit 1
+        fi
+        echo "✅ Placeholders processed"
+        
+        # Test connection and validate
+        echo "🔗 Testing Nomad connection..."
+        MAX_CONN_ATTEMPTS=3
+        CONN_ATTEMPT=0
+        
+        while [ $CONN_ATTEMPT -lt $MAX_CONN_ATTEMPTS ]; do
+          if nomad node status >/dev/null 2>&1; then
+            echo "✅ Connection verified"
+            break
+          fi
           
-          sleep 10
-          ATTEMPT=$((ATTEMPT + 1))
+          CONN_ATTEMPT=$((CONN_ATTEMPT + 1))
+          if [ $CONN_ATTEMPT -lt $MAX_CONN_ATTEMPTS ]; then
+            echo "⏳ Retry $CONN_ATTEMPT/$MAX_CONN_ATTEMPTS..."
+            sleep 5
+          else
+            echo "❌ Connection failed after $MAX_CONN_ATTEMPTS attempts"
+            exit 1
+          fi
         done
         
-        echo "❌ Deployment timed out after $((MAX_ATTEMPTS * 10)) seconds"
-        nomad job status outlook-service || true
+        echo "🔍 Validating job configuration..."
+        if ! nomad job validate "$HCL_FILE"; then
+          echo "❌ Validation failed"
+          echo "📄 File content:"
+          cat "$HCL_FILE"
+          exit 1
+        fi
+        echo "✅ Job validated"
+        
+        # Deploy with planning
+        echo "📋 Planning deployment..."
+        nomad job plan "$HCL_FILE" || echo "⚠️ Planning completed with warnings"
+        
+        echo "🚀 Deploying ${{ env.SERVICE_NAME }}..."
+        if ! nomad job run "$HCL_FILE"; then
+          echo "❌ Deployment failed"
+          nomad job status ${{ env.SERVICE_NAME }} 2>/dev/null || true
+          exit 1
+        fi
+        echo "✅ Deployment initiated"
+        
+        # Enhanced monitoring
+        echo "⏳ Monitoring deployment progress..."
+        MAX_WAIT=60
+        WAIT=0
+        CONSECUTIVE_RUNNING=0
+        
+        while [ $WAIT -lt $MAX_WAIT ]; do
+          STATUS=$(nomad job status ${{ env.SERVICE_NAME }} 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "checking")
+          
+          case "$STATUS" in
+            "running")
+              CONSECUTIVE_RUNNING=$((CONSECUTIVE_RUNNING + 1))
+              echo "📊 Status: running (stable: $CONSECUTIVE_RUNNING/3)"
+              
+              if [ $CONSECUTIVE_RUNNING -ge 3 ]; then
+                echo "✅ ${{ env.SERVICE_NAME }} deployed successfully!"
+                
+                # Show summary
+                nomad job status ${{ env.SERVICE_NAME }} | head -12
+                
+                # Optional health verification
+                echo "🏥 Checking service health..."
+                for i in {1..5}; do
+                  if timeout 10 curl -f -s http://localhost:${{ env.SERVICE_PORT }}/health >/dev/null 2>&1; then
+                    echo "✅ Health check passed"
+                    break
+                  elif [ $i -eq 5 ]; then
+                    echo "⚠️ Health check not accessible (this may be normal)"
+                  else
+                    echo "🔄 Health attempt $i/5..."
+                    sleep 8
+                  fi
+                done
+                
+                exit 0
+              fi
+              ;;
+            "dead"|"failed")
+              echo "❌ Deployment failed with status: $STATUS"
+              nomad job status ${{ env.SERVICE_NAME }} | head -15
+              echo ""
+              echo "📋 Allocation details:"
+              nomad job allocs ${{ env.SERVICE_NAME }} | head -5
+              exit 1
+              ;;
+            *)
+              CONSECUTIVE_RUNNING=0
+              if [ $((WAIT % 12)) -eq 0 ]; then
+                echo "📊 Status: $STATUS (${WAIT}s/${MAX_WAIT}s)"
+              fi
+              ;;
+          esac
+          
+          sleep 5
+          WAIT=$((WAIT + 1))
+        done
+        
+        echo "❌ Deployment monitoring timeout"
+        nomad job status ${{ env.SERVICE_NAME }} || true
         exit 1
