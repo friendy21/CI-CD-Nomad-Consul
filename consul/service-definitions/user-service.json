@@ -1,1 +1,24 @@
 
+{
+  "service": {
+    "name": "user-service",
+    "port": 5001,
+    "tags": ["api", "backend", "v1"],
+    "meta": {
+      "version": "1.0.0",
+      "protocol": "http"
+    },
+    "check": {
+      "id": "user-service-health",
+      "name": "User Service Health Check",
+      "http": "http://localhost:5001/health",
+      "method": "GET",
+      "interval": "30s",
+      "timeout": "5s"
+    },
+    "weights": {
+      "passing": 10,
+      "warning": 1
+    }
+  }
+}
