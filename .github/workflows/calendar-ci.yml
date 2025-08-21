@@ -59,49 +59,61 @@ jobs:
       
     - name: Setup Nomad
       run: |
-        # Install Nomad CLI
+        # Remove any existing nomad binary first
+        sudo rm -f /usr/local/bin/nomad
+        
+        # Download and install Nomad with -o flag to force overwrite
         curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip
-        unzip nomad.zip
+        unzip -o nomad.zip
         sudo mv nomad /usr/local/bin/
-        rm nomad.zip
+        rm -f nomad.zip LICENSE.txt
+        
+        # Verify installation
         nomad version
 
-    - name: Update and deploy Nomad job
+    - name: Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        # Replace placeholders in job file
+        # Replace placeholders
         sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/calendar.hcl
         sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/calendar.hcl
         
-        # Validate job file
-        nomad job validate nomad/calendar.hcl
+        # Validate job
+        if ! nomad job validate nomad/calendar.hcl; then
+          echo "❌ Job validation failed"
+          cat nomad/calendar.hcl
+          exit 1
+        fi
         
-        # Deploy the job
+        # Run the job
+        echo "🚀 Deploying calendar-service..."
         nomad job run nomad/calendar.hcl
         
-        # Wait for deployment (without -timeout flag)
+        # Wait for deployment
+        echo "⏳ Waiting for deployment..."
         MAX_ATTEMPTS=30
         ATTEMPT=0
         
-        echo "⏳ Waiting for deployment to complete..."
         while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          if nomad job status calendar-service 2>/dev/null | grep -q "Status.*running"; then
+          STATUS=$(nomad job status calendar-service 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "pending")
+          echo "Status check $((ATTEMPT + 1))/$MAX_ATTEMPTS: $STATUS"
+          
+          if [ "$STATUS" = "running" ]; then
             echo "✅ Calendar service is running!"
-            break
+            nomad job status calendar-service
+            exit 0
+          elif [ "$STATUS" = "dead" ] || [ "$STATUS" = "failed" ]; then
+            echo "❌ Deployment failed with status: $STATUS"
+            nomad job status calendar-service
+            exit 1
           fi
           
-          echo "Attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS - Service not ready yet..."
           sleep 10
           ATTEMPT=$((ATTEMPT + 1))
         done
         
-        if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-          echo "❌ Deployment timed out"
-          nomad job status calendar-service
-          exit 1
-        fi
-        
-        echo "✅ Calendar service deployed successfully!"
-        nomad job status calendar-service
+        echo "❌ Deployment timed out after $((MAX_ATTEMPTS * 10)) seconds"
+        nomad job status calendar-service || true
+        exit 1
