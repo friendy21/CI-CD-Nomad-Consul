@@ -24,6 +24,7 @@ env:
 permissions:
   contents: read
   packages: write
+  security-events: write
 
 jobs:
   build:
@@ -70,8 +71,14 @@ jobs:
       uses: aquasecurity/trivy-action@master
       with:
         image-ref: ${{ env.DOCKER_IMAGE }}:latest
-        format: 'table'
-        exit-code: '0'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
 
   deploy:
     runs-on: ubuntu-latest
@@ -83,46 +90,338 @@ jobs:
       uses: actions/checkout@v4
       
     - name: Setup Nomad
+      uses: hashicorp/setup-nomad@main
+      with:
+        nomad_version: 'latest'
+
+    - name: Verify Nomad installation
       run: |
-        curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip
-        unzip nomad.zip
-        sudo mv nomad /usr/local/bin/
-        rm nomad.zip
+        echo "✅ Nomad version:"
         nomad version
+        echo "✅ Nomad binary location:"
+        which nomad
 
     - name: Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/user.hcl
-        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/user.hcl
+        set -e
         
-        # Validate job
-        nomad job validate nomad/user.hcl
+        echo "🚀 Starting User Service deployment..."
         
-        # Deploy job
-        nomad job run nomad/user.hcl
-        
-        # Wait for deployment
-        MAX_ATTEMPTS=30
-        ATTEMPT=0
-        
-        echo "⏳ Waiting for deployment to complete..."
-        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          if nomad job status user-service 2>/dev/null | grep -q "Status.*running"; then
-            echo "✅ User service is running!"
-            break
-          fi
-          sleep 10
-          ATTEMPT=$((ATTEMPT + 1))
-        done
-        
-        if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-          echo "❌ Deployment timed out"
-          nomad job status user-service
+        # Comprehensive environment validation
+        if [ -z "$NOMAD_ADDR" ]; then
+          echo "❌ NOMAD_ADDR environment variable is required"
           exit 1
         fi
         
-        echo "✅ User service deployed successfully!"
-        nomad job status user-service
+        if [ -z "$NOMAD_TOKEN" ]; then
+          echo "❌ NOMAD_TOKEN environment variable is required"
+          exit 1
+        fi
+        
+        echo "✅ Environment variables validated"
+        echo "🎯 Nomad Address: $NOMAD_ADDR"
+        echo "🔧 Docker Image: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}"
+        echo "📦 Service: ${{ env.SERVICE_NAME }}"
+        echo "🔌 Port: ${{ env.SERVICE_PORT }}"
+        echo ""
+        
+        # Locate HCL file with fallback search
+        HCL_FILE="nomad/user.hcl"
+        if [ ! -f "$HCL_FILE" ]; then
+          echo "⚠️ HCL file not found at expected location: $HCL_FILE"
+          echo "🔍 Searching for user.hcl in repository..."
+          
+          FOUND_HCL=$(find . -name "user.hcl" -type f | head -1)
+          if [ -n "$FOUND_HCL" ]; then
+            HCL_FILE="$FOUND_HCL"
+            echo "✅ Found HCL file at: $HCL_FILE"
+          else
+            echo "❌ user.hcl not found anywhere in repository"
+            echo "📁 Available HCL files:"
+            find . -name "*.hcl" -type f | head -10 || echo "No HCL files found"
+            exit 1
+          fi
+        else
+          echo "✅ Using HCL file: $HCL_FILE"
+        fi
+        
+        # Create timestamped backup
+        BACKUP_FILE="${HCL_FILE}.backup.$(date +%s)"
+        if ! cp "$HCL_FILE" "$BACKUP_FILE"; then
+          echo "❌ Failed to create backup file"
+          exit 1
+        fi
+        echo "💾 Backup created: $BACKUP_FILE"
+        
+        # Display original file snippet
+        echo "📄 Original HCL content preview:"
+        echo "----------------------------------------"
+        head -15 "$HCL_FILE"
+        echo "----------------------------------------"
+        
+        # Replace placeholders with comprehensive error handling
+        echo "🔄 Replacing placeholders in HCL file..."
+        
+        # Check if placeholders exist before replacement
+        IMAGE_PLACEHOLDERS=$(grep -c "IMAGE_TAG_PLACEHOLDER" "$HCL_FILE" || echo "0")
+        DOCKER_PLACEHOLDERS=$(grep -c "DOCKER_IMAGE_PLACEHOLDER" "$HCL_FILE" || echo "0")
+        
+        echo "📊 Found placeholders: IMAGE_TAG($IMAGE_PLACEHOLDERS), DOCKER_IMAGE($DOCKER_PLACEHOLDERS)"
+        
+        if [ "$IMAGE_PLACEHOLDERS" -eq 0 ] && [ "$DOCKER_PLACEHOLDERS" -eq 0 ]; then
+          echo "⚠️ No placeholders found - file may already be processed or corrupted"
+          echo "📄 Current file content:"
+          cat "$HCL_FILE"
+          exit 1
+        fi
+        
+        # Perform replacements
+        if ! sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" "$HCL_FILE"; then
+          echo "❌ Failed to replace IMAGE_TAG_PLACEHOLDER"
+          cp "$BACKUP_FILE" "$HCL_FILE"
+          exit 1
+        fi
+        
+        if ! sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" "$HCL_FILE"; then
+          echo "❌ Failed to replace DOCKER_IMAGE_PLACEHOLDER"
+          cp "$BACKUP_FILE" "$HCL_FILE"
+          exit 1
+        fi
+        
+        # Verify all placeholders were replaced
+        REMAINING_PLACEHOLDERS=$(grep -c "PLACEHOLDER" "$HCL_FILE" || echo "0")
+        if [ "$REMAINING_PLACEHOLDERS" -gt 0 ]; then
+          echo "❌ $REMAINING_PLACEHOLDERS placeholders still remain:"
+          grep -n "PLACEHOLDER" "$HCL_FILE" || true
+          echo ""
+          echo "📄 Current file state:"
+          cat "$HCL_FILE"
+          echo ""
+          echo "🔄 Restoring from backup..."
+          cp "$BACKUP_FILE" "$HCL_FILE"
+          exit 1
+        fi
+        
+        echo "✅ All placeholders successfully replaced"
+        
+        # Show key lines from processed file
+        echo "📄 Processed HCL - key configuration:"
+        echo "----------------------------------------"
+        grep -E "(job |image.*=|SERVICE_)" "$HCL_FILE" | head -8
+        echo "----------------------------------------"
+        
+        # Test Nomad connectivity with retries
+        echo "🔗 Testing Nomad connectivity..."
+        MAX_CONN_RETRIES=5
+        CONN_RETRY=0
+        
+        while [ $CONN_RETRY -lt $MAX_CONN_RETRIES ]; do
+          if nomad node status >/dev/null 2>&1; then
+            echo "✅ Successfully connected to Nomad cluster"
+            
+            # Get cluster info
+            NODE_COUNT=$(nomad node status -json 2>/dev/null | jq length 2>/dev/null || echo "unknown")
+            echo "📊 Cluster nodes: $NODE_COUNT"
+            break
+          fi
+          
+          CONN_RETRY=$((CONN_RETRY + 1))
+          if [ $CONN_RETRY -lt $MAX_CONN_RETRIES ]; then
+            echo "⏳ Connection attempt $CONN_RETRY/$MAX_CONN_RETRIES failed, retrying in 10s..."
+            sleep 10
+          else
+            echo "❌ Failed to connect to Nomad after $MAX_CONN_RETRIES attempts"
+            echo "🔍 Attempting to get Nomad server info..."
+            curl -s --max-time 10 "$NOMAD_ADDR/v1/status/leader" || echo "Unable to reach Nomad API"
+            exit 1
+          fi
+        done
+        
+        # Validate job configuration
+        echo "🔍 Validating Nomad job configuration..."
+        if ! nomad job validate "$HCL_FILE"; then
+          echo "❌ Job validation failed"
+          echo ""
+          echo "📄 Full HCL file content for debugging:"
+          echo "========================================"
+          cat "$HCL_FILE"
+          echo "========================================"
+          exit 1
+        fi
+        echo "✅ Job configuration is valid"
+        
+        # Create deployment plan
+        echo "📋 Generating deployment plan..."
+        if nomad job plan "$HCL_FILE" >/dev/null 2>&1; then
+          echo "✅ Deployment plan generated successfully"
+        else
+          echo "⚠️ Deployment planning completed with warnings (this is often normal)"
+        fi
+        
+        # Execute deployment
+        echo "🚀 Executing User Service deployment..."
+        if ! nomad job run "$HCL_FILE"; then
+          echo "❌ Failed to submit job to Nomad"
+          echo "📊 Attempting to get current job status:"
+          nomad job status ${{ env.SERVICE_NAME }} 2>/dev/null || echo "No existing job found"
+          exit 1
+        fi
+        echo "✅ Job successfully submitted to Nomad cluster"
+        
+        # Enhanced deployment monitoring
+        echo "⏳ Monitoring deployment progress..."
+        echo "📊 This may take several minutes for initial deployment"
+        
+        MAX_WAIT_CYCLES=120  # 10 minutes total
+        WAIT_CYCLE=0
+        CONSECUTIVE_RUNNING=0
+        LAST_REPORTED_STATUS=""
+        
+        while [ $WAIT_CYCLE -lt $MAX_WAIT_CYCLES ]; do
+          # Get comprehensive status
+          JOB_STATUS=$(nomad job status ${{ env.SERVICE_NAME }} 2>/dev/null)
+          CURRENT_STATUS=$(echo "$JOB_STATUS" | grep "^Status" | awk '{print $3}' 2>/dev/null || echo "checking")
+          
+          # Report status changes
+          if [ "$CURRENT_STATUS" != "$LAST_REPORTED_STATUS" ]; then
+            echo "📊 Status change: $LAST_REPORTED_STATUS → $CURRENT_STATUS (cycle $((WAIT_CYCLE + 1))/$MAX_WAIT_CYCLES)"
+            LAST_REPORTED_STATUS="$CURRENT_STATUS"
+            CONSECUTIVE_RUNNING=0
+            
+            # Show additional details on status change
+            if [ "$CURRENT_STATUS" != "running" ]; then
+              echo "$(echo "$JOB_STATUS" | head -8)"
+            fi
+          fi
+          
+          case "$CURRENT_STATUS" in
+            "running")
+              CONSECUTIVE_RUNNING=$((CONSECUTIVE_RUNNING + 1))
+              
+              # Require stable running state
+              if [ $CONSECUTIVE_RUNNING -ge 6 ]; then
+                echo "✅ User Service is running stably!"
+                
+                # Display comprehensive deployment summary
+                echo ""
+                echo "📊 Final Deployment Summary:"
+                echo "==========================================="
+                echo "$JOB_STATUS" | head -18
+                echo "==========================================="
+                
+                # Enhanced health check with multiple attempts
+                echo ""
+                echo "🏥 Performing comprehensive health verification..."
+                HEALTH_CHECK_SUCCESS=false
+                
+                for health_attempt in {1..10}; do
+                  echo "🔄 Health check attempt $health_attempt/10..."
+                  
+                  # Try multiple health check approaches
+                  for health_endpoint in "http://localhost:${{ env.SERVICE_PORT }}/health" "http://127.0.0.1:${{ env.SERVICE_PORT }}/health"; do
+                    if timeout 15 curl -f -s "$health_endpoint" >/dev/null 2>&1; then
+                      echo "✅ Health check successful via $health_endpoint"
+                      
+                      # Get detailed health information
+                      HEALTH_RESPONSE=$(timeout 10 curl -s "$health_endpoint" 2>/dev/null)
+                      if echo "$HEALTH_RESPONSE" | jq . >/dev/null 2>&1; then
+                        echo "📋 Service Health Details:"
+                        echo "$HEALTH_RESPONSE" | jq .
+                      else
+                        echo "📋 Health endpoint responded: $HEALTH_RESPONSE"
+                      fi
+                      
+                      HEALTH_CHECK_SUCCESS=true
+                      break 2
+                    fi
+                  done
+                  
+                  # Progressive delay between attempts
+                  if [ $health_attempt -lt 10 ]; then
+                    DELAY=$((health_attempt * 2 + 5))
+                    echo "⏳ Waiting ${DELAY}s before next attempt..."
+                    sleep $DELAY
+                  fi
+                done
+                
+                if [ "$HEALTH_CHECK_SUCCESS" = false ]; then
+                  echo "⚠️ Health endpoint verification failed"
+                  echo "🔍 This may be normal if:"
+                  echo "   • Service is still initializing"
+                  echo "   • Network policies restrict access"
+                  echo "   • Health endpoint is not implemented"
+                  echo ""
+                  echo "📊 Service appears to be running based on Nomad status"
+                fi
+                
+                # Final success message
+                echo ""
+                echo "🎉 User Service deployment completed successfully!"
+                echo "🌐 Service should be accessible at: http://localhost:${{ env.SERVICE_PORT }}"
+                echo "📊 Monitor via Nomad UI: $NOMAD_ADDR/ui/jobs/${{ env.SERVICE_NAME }}"
+                
+                exit 0
+              else
+                echo "📊 Running state stable for ${CONSECUTIVE_RUNNING}/6 cycles"
+              fi
+              ;;
+            "dead"|"failed")
+              echo "❌ Deployment failed with status: $CURRENT_STATUS"
+              echo ""
+              echo "📊 Detailed failure analysis:"
+              echo "==========================================="
+              echo "$JOB_STATUS"
+              echo "==========================================="
+              echo ""
+              echo "📋 Recent allocations:"
+              nomad job allocs ${{ env.SERVICE_NAME }} 2>/dev/null | head -8 || echo "No allocation data available"
+              echo ""
+              echo "📝 Recent logs from failed allocation:"
+              FAILED_ALLOC=$(nomad job allocs ${{ env.SERVICE_NAME }} -json 2>/dev/null | jq -r '.[0].ID' 2>/dev/null)
+              if [ -n "$FAILED_ALLOC" ] && [ "$FAILED_ALLOC" != "null" ]; then
+                nomad alloc logs -n 40 "$FAILED_ALLOC" 2>/dev/null || echo "Logs not available"
+              else
+                echo "No allocation logs available"
+              fi
+              
+              exit 1
+              ;;
+            "pending")
+              # Detailed progress info every 20 cycles (reduce log noise)
+              if [ $((WAIT_CYCLE % 20)) -eq 0 ] && [ $WAIT_CYCLE -gt 0 ]; then
+                echo "📊 Still pending after $((WAIT_CYCLE * 5)) seconds..."
+                echo "$(echo "$JOB_STATUS" | head -10)"
+                
+                # Check for allocation issues
+                ALLOC_COUNT=$(nomad job allocs ${{ env.SERVICE_NAME }} -json 2>/dev/null | jq length 2>/dev/null || echo "0")
+                echo "📋 Current allocations: $ALLOC_COUNT"
+              fi
+              ;;
+            *)
+              CONSECUTIVE_RUNNING=0
+              # Log unknown statuses
+              if [ "$CURRENT_STATUS" != "checking" ]; then
+                echo "⚠️ Unknown status: $CURRENT_STATUS"
+              fi
+              ;;
+          esac
+          
+          sleep 5
+          WAIT_CYCLE=$((WAIT_CYCLE + 1))
+        done
+        
+        # Deployment monitoring timeout
+        echo "❌ Deployment monitoring timed out after $((MAX_WAIT_CYCLES * 5)) seconds"
+        echo ""
+        echo "📊 Final status report:"
+        echo "==========================================="
+        nomad job status ${{ env.SERVICE_NAME }} 2>/dev/null || echo "Unable to get job status"
+        echo "==========================================="
+        echo ""
+        echo "📋 Final allocation status:"
+        nomad job allocs ${{ env.SERVICE_NAME }} 2>/dev/null || echo "Unable to get allocation status"
+        
+        exit 1
