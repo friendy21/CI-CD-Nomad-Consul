@@ -1,0 +1,113 @@
+name: CI/CD for User Service
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "user/**"
+      - ".github/workflows/user-ci.yml"
+      - "nomad/user.hcl"
+      - "docker/Dockerfile.stage"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "user/**"
+      - ".github/workflows/user-ci.yml"
+      - "nomad/user.hcl"
+
+env:
+  IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
+  DOCKER_IMAGE: friendy21/user-service
+  SERVICE_NAME: user-service
+  SERVICE_PORT: 5001
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_IMAGE }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+        
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./user
+        file: ./docker/Dockerfile.stage
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VERSION=${{ env.IMAGE_TAG }}
+
+    - name: Run security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_IMAGE }}:latest
+        format: 'table'
+        exit-code: '0'
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Nomad
+      run: |
+        curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+        sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+        sudo apt-get update && sudo apt-get install nomad
+
+    - name: Update Nomad job with new image
+      run: |
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/user.hcl
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/user.hcl
+        
+    - name: Validate Nomad job
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+      run: |
+        nomad job validate nomad/user.hcl
+
+    - name: Deploy to Nomad
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+      run: |
+        nomad job run nomad/user.hcl
+        
+    - name: Wait for deployment
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+      run: |
+        timeout 300 bash -c 'until nomad job status user-service | grep -q "Status.*running"; do echo "Waiting for deployment..."; sleep 10; done'
+        echo "✅ User service deployed successfully!"
