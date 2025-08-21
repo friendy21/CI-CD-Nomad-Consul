@@ -47,6 +47,9 @@ jobs:
           ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VERSION=${{ env.IMAGE_TAG }}
 
   deploy:
     runs-on: ubuntu-latest
@@ -57,18 +60,52 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       
+    - name: Debug repository structure
+      run: |
+        echo "🔍 Debugging repository structure..."
+        echo "📁 Current directory: $(pwd)"
+        echo "📁 Directory contents:"
+        ls -la
+        echo ""
+        echo "🔍 Looking for Nomad HCL files:"
+        find . -name "*.hcl" -type f || echo "No .hcl files found"
+        echo ""
+        echo "📁 Checking nomad directory:"
+        if [ -d nomad ]; then
+          echo "✅ nomad directory exists"
+          ls -la nomad/
+        else
+          echo "❌ nomad directory not found"
+        fi
+        echo ""
+        echo "📁 Checking docker directory:"
+        if [ -d docker ]; then
+          echo "✅ docker directory exists"
+          ls -la docker/
+        else
+          echo "❌ docker directory not found"
+        fi
+      
     - name: Setup Nomad
       run: |
         # Clean up any existing nomad files/directories
-        sudo rm -rf /usr/local/bin/nomad
-        sudo rm -rf nomad
-        rm -f nomad.zip LICENSE.txt
+        sudo rm -rf /usr/local/bin/nomad 2>/dev/null || true
+        sudo rm -rf nomad_temp 2>/dev/null || true
+        rm -f nomad.zip LICENSE.txt 2>/dev/null || true
         
         # Download Nomad
-        curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip
+        echo "📥 Downloading Nomad 1.8.3..."
+        if ! curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip; then
+          echo "❌ Failed to download Nomad"
+          exit 1
+        fi
         
         # Extract with overwrite flag
-        unzip -o nomad.zip
+        echo "📦 Extracting Nomad..."
+        if ! unzip -o nomad.zip; then
+          echo "❌ Failed to extract Nomad"
+          exit 1
+        fi
         
         # Move the binary to /usr/local/bin
         chmod +x nomad
@@ -78,52 +115,187 @@ jobs:
         rm -f nomad.zip LICENSE.txt
         
         # Verify installation
+        echo "✅ Nomad installation verified:"
         which nomad
         nomad version
 
-    - name: Deploy to Nomad
+    - name: Validate and Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        # Replace placeholders
-        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/calendar.hcl
-        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/calendar.hcl
+        set -e  # Exit on any error
         
-        # Validate job
-        if ! nomad job validate nomad/calendar.hcl; then
-          echo "❌ Job validation failed"
-          cat nomad/calendar.hcl
+        echo "🔍 Validating environment..."
+        
+        # Check required environment variables
+        if [ -z "$NOMAD_ADDR" ]; then
+          echo "❌ NOMAD_ADDR is not set"
           exit 1
         fi
         
-        # Run the job
-        echo "🚀 Deploying calendar-service..."
-        nomad job run nomad/calendar.hcl
+        if [ -z "$NOMAD_TOKEN" ]; then
+          echo "❌ NOMAD_TOKEN is not set"
+          exit 1
+        fi
         
-        # Wait for deployment
-        echo "⏳ Waiting for deployment..."
-        MAX_ATTEMPTS=30
-        ATTEMPT=0
+        echo "✅ Environment variables validated"
+        echo "🎯 Nomad Address: $NOMAD_ADDR"
+        echo "🔧 Image: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}"
         
-        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          STATUS=$(nomad job status calendar-service 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "pending")
-          echo "Status check $((ATTEMPT + 1))/$MAX_ATTEMPTS: $STATUS"
+        # Find the HCL file
+        HCL_FILE="nomad/calendar.hcl"
+        
+        if [ ! -f "$HCL_FILE" ]; then
+          echo "❌ HCL file not found at expected location: $HCL_FILE"
+          echo "🔍 Searching for calendar.hcl in entire repository..."
           
-          if [ "$STATUS" = "running" ]; then
-            echo "✅ Calendar service is running!"
-            nomad job status calendar-service
-            exit 0
-          elif [ "$STATUS" = "dead" ] || [ "$STATUS" = "failed" ]; then
-            echo "❌ Deployment failed with status: $STATUS"
-            nomad job status calendar-service
+          FOUND_FILE=$(find . -name "calendar.hcl" -type f | head -1)
+          if [ -n "$FOUND_FILE" ]; then
+            echo "✅ Found HCL file at: $FOUND_FILE"
+            HCL_FILE="$FOUND_FILE"
+          else
+            echo "❌ calendar.hcl not found anywhere in repository"
+            echo "📁 Available files:"
+            find . -name "*.hcl" -type f || echo "No .hcl files found"
             exit 1
           fi
+        else
+          echo "✅ Found HCL file at expected location: $HCL_FILE"
+        fi
+        
+        # Create backup
+        cp "$HCL_FILE" "${HCL_FILE}.backup"
+        echo "💾 Created backup: ${HCL_FILE}.backup"
+        
+        # Show original content for debugging
+        echo "📄 Original HCL file content:"
+        echo "----------------------------------------"
+        cat "$HCL_FILE"
+        echo "----------------------------------------"
+        
+        # Replace placeholders
+        echo "🔄 Replacing placeholders..."
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" "$HCL_FILE"
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" "$HCL_FILE"
+        
+        # Verify replacements
+        echo "🔍 Checking for remaining placeholders..."
+        if grep -q "PLACEHOLDER" "$HCL_FILE"; then
+          echo "❌ Placeholder replacement failed. Remaining placeholders:"
+          grep "PLACEHOLDER" "$HCL_FILE" || true
+          echo ""
+          echo "📄 Current file content:"
+          echo "----------------------------------------"
+          cat "$HCL_FILE"
+          echo "----------------------------------------"
+          exit 1
+        fi
+        
+        echo "✅ Placeholders replaced successfully"
+        
+        # Show final content for verification
+        echo "📄 Final HCL file content:"
+        echo "----------------------------------------"
+        cat "$HCL_FILE"
+        echo "----------------------------------------"
+        
+        # Test Nomad connectivity
+        echo "🔗 Testing Nomad connectivity..."
+        if ! nomad node status >/dev/null 2>&1; then
+          echo "❌ Cannot connect to Nomad at $NOMAD_ADDR"
+          echo "🔍 Nomad server info:"
+          curl -s "$NOMAD_ADDR/v1/status/leader" || echo "Failed to get leader info"
+          exit 1
+        fi
+        echo "✅ Nomad connectivity verified"
+        
+        # Validate job
+        echo "🔍 Validating Nomad job..."
+        if ! nomad job validate "$HCL_FILE"; then
+          echo "❌ Job validation failed"
+          echo "📄 Job file contents:"
+          cat "$HCL_FILE"
+          exit 1
+        fi
+        echo "✅ Job validation passed"
+        
+        # Run the job
+        echo "🚀 Deploying calendar-service..."
+        if ! nomad job run "$HCL_FILE"; then
+          echo "❌ Job submission failed"
+          nomad job status calendar-service || true
+          exit 1
+        fi
+        echo "✅ Job submitted successfully"
+        
+        # Wait for deployment with improved monitoring
+        echo "⏳ Waiting for deployment to complete..."
+        MAX_ATTEMPTS=60  # Increased from 30
+        ATTEMPT=0
+        LAST_STATUS=""
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          # Get job status with error handling
+          STATUS=$(nomad job status calendar-service 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "unknown")
+          
+          # Only log status changes to reduce noise
+          if [ "$STATUS" != "$LAST_STATUS" ]; then
+            echo "📊 Status update ($((ATTEMPT + 1))/$MAX_ATTEMPTS): $STATUS"
+            LAST_STATUS="$STATUS"
+          fi
+          
+          case "$STATUS" in
+            "running")
+              echo "✅ Calendar service is running!"
+              
+              # Get allocation info
+              echo "📊 Deployment summary:"
+              nomad job status calendar-service | head -20
+              
+              # Optional: Test health endpoint
+              echo "🏥 Testing health endpoint (will retry if not ready)..."
+              for health_attempt in {1..5}; do
+                if curl -f -s "http://localhost:${{ env.SERVICE_PORT }}/health" >/dev/null 2>&1; then
+                  echo "✅ Health check passed"
+                  break
+                elif [ $health_attempt -eq 5 ]; then
+                  echo "⚠️ Health check failed, but service is running"
+                else
+                  echo "🔄 Health check attempt $health_attempt/5..."
+                  sleep 10
+                fi
+              done
+              
+              exit 0
+              ;;
+            "dead"|"failed")
+              echo "❌ Deployment failed with status: $STATUS"
+              echo "📊 Job status details:"
+              nomad job status calendar-service || true
+              echo ""
+              echo "📋 Recent allocations:"
+              nomad job allocs calendar-service || true
+              exit 1
+              ;;
+            "pending")
+              # Only show detailed info every 10 attempts to reduce noise
+              if [ $((ATTEMPT % 10)) -eq 0 ] && [ $ATTEMPT -gt 0 ]; then
+                echo "📊 Still pending after $((ATTEMPT * 10)) seconds..."
+                nomad job status calendar-service | head -10 || true
+              fi
+              ;;
+          esac
           
           sleep 10
           ATTEMPT=$((ATTEMPT + 1))
         done
         
+        # Timeout reached
         echo "❌ Deployment timed out after $((MAX_ATTEMPTS * 10)) seconds"
+        echo "📊 Final job status:"
         nomad job status calendar-service || true
+        echo ""
+        echo "📋 Allocations:"
+        nomad job allocs calendar-service || true
         exit 1
