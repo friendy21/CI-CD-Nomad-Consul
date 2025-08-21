@@ -59,16 +59,26 @@ jobs:
       
     - name: Setup Nomad
       run: |
-        # Remove any existing nomad binary first
-        sudo rm -f /usr/local/bin/nomad
+        # Clean up any existing nomad files/directories
+        sudo rm -rf /usr/local/bin/nomad
+        sudo rm -rf nomad
+        rm -f nomad.zip LICENSE.txt
         
-        # Download and install Nomad with -o flag to force overwrite
+        # Download Nomad
         curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip
+        
+        # Extract with overwrite flag
         unzip -o nomad.zip
-        sudo mv nomad /usr/local/bin/
+        
+        # Move the binary to /usr/local/bin
+        chmod +x nomad
+        sudo mv nomad /usr/local/bin/nomad
+        
+        # Clean up
         rm -f nomad.zip LICENSE.txt
         
         # Verify installation
+        which nomad
         nomad version
 
     - name: Deploy to Nomad
