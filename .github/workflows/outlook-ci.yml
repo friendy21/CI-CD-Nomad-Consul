@@ -59,16 +59,39 @@ jobs:
       
     - name: Setup Nomad
       run: |
-        curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
-        sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
-        sudo apt-get update && sudo apt-get install nomad
+        curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip
+        unzip nomad.zip
+        sudo mv nomad /usr/local/bin/
+        rm nomad.zip
+        nomad version
 
     - name: Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
         sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/outlook.hcl
         sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/outlook.hcl
+        
+        nomad job validate nomad/outlook.hcl
         nomad job run nomad/outlook.hcl
-        timeout 300 bash -c 'until nomad job status outlook-service | grep -q "Status.*running"; do echo "Waiting..."; sleep 10; done'
+        
+        # Wait for deployment
+        MAX_ATTEMPTS=30
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          if nomad job status outlook-service 2>/dev/null | grep -q "Status.*running"; then
+            echo "✅ Outlook service is running!"
+            break
+          fi
+          sleep 10
+          ATTEMPT=$((ATTEMPT + 1))
+        done
+        
+        if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+          echo "❌ Deployment timed out"
+          exit 1
+        fi
+        
         echo "✅ Outlook service deployed!"
