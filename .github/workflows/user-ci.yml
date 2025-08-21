@@ -84,30 +84,45 @@ jobs:
       
     - name: Setup Nomad
       run: |
-        curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
-        sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
-        sudo apt-get update && sudo apt-get install nomad
-
-    - name: Update Nomad job with new image
-      run: |
-        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/user.hcl
-        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/user.hcl
-        
-    - name: Validate Nomad job
-      env:
-        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
-      run: |
-        nomad job validate nomad/user.hcl
+        curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip
+        unzip nomad.zip
+        sudo mv nomad /usr/local/bin/
+        rm nomad.zip
+        nomad version
 
     - name: Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/user.hcl
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/user.hcl
+        
+        # Validate job
+        nomad job validate nomad/user.hcl
+        
+        # Deploy job
         nomad job run nomad/user.hcl
         
-    - name: Wait for deployment
-      env:
-        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
-      run: |
-        timeout 300 bash -c 'until nomad job status user-service | grep -q "Status.*running"; do echo "Waiting for deployment..."; sleep 10; done'
+        # Wait for deployment
+        MAX_ATTEMPTS=30
+        ATTEMPT=0
+        
+        echo "⏳ Waiting for deployment to complete..."
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          if nomad job status user-service 2>/dev/null | grep -q "Status.*running"; then
+            echo "✅ User service is running!"
+            break
+          fi
+          sleep 10
+          ATTEMPT=$((ATTEMPT + 1))
+        done
+        
+        if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+          echo "❌ Deployment timed out"
+          nomad job status user-service
+          exit 1
+        fi
+        
         echo "✅ User service deployed successfully!"
+        nomad job status user-service
