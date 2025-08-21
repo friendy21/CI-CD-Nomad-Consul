@@ -1,0 +1,74 @@
+name: CI/CD for Outlook Service
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "outlook/**"
+      - ".github/workflows/outlook-ci.yml"
+      - "nomad/outlook.hcl"
+      - "docker/Dockerfile.stage"
+
+env:
+  IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
+  DOCKER_IMAGE: friendy21/outlook-service
+  SERVICE_NAME: outlook-service
+  SERVICE_PORT: 5004
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./outlook
+        file: ./docker/Dockerfile.stage
+        push: true
+        tags: |
+          ${{ env.DOCKER_IMAGE }}:latest
+          ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Nomad
+      run: |
+        curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+        sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+        sudo apt-get update && sudo apt-get install nomad
+
+    - name: Deploy to Nomad
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+      run: |
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/outlook.hcl
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/outlook.hcl
+        nomad job run nomad/outlook.hcl
+        timeout 300 bash -c 'until nomad job status outlook-service | grep -q "Status.*running"; do echo "Waiting..."; sleep 10; done'
+        echo "✅ Outlook service deployed!"
