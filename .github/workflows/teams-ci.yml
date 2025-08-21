@@ -57,18 +57,176 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       
+    - name: Validate required secrets
+      run: |
+        if [ -z "${{ secrets.NOMAD_ADDR }}" ]; then
+          echo "❌ NOMAD_ADDR secret is not set"
+          exit 1
+        fi
+        if [ -z "${{ secrets.NOMAD_TOKEN }}" ]; then
+          echo "⚠️ NOMAD_TOKEN secret is not set - continuing without authentication"
+        fi
+      
     - name: Setup Nomad
       run: |
-        curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
-        sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
-        sudo apt-get update && sudo apt-get install nomad
+        # Download and install Nomad
+        NOMAD_VERSION="1.8.3"
+        curl -fsSL https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_amd64.zip -o nomad.zip
+        sudo unzip nomad.zip -d /usr/local/bin/
+        sudo chmod +x /usr/local/bin/nomad
+        rm nomad.zip
+        
+        # Verify installation
+        nomad version
+
+    - name: Test Nomad connectivity
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      run: |
+        echo "🔍 Testing connection to Nomad at: $NOMAD_ADDR"
+        
+        # Test basic connectivity
+        if ! timeout 30 nomad node status > /dev/null 2>&1; then
+          echo "❌ Cannot connect to Nomad server"
+          echo "Nomad Address: $NOMAD_ADDR"
+          echo "Please verify:"
+          echo "1. Nomad server is running and accessible"
+          echo "2. NOMAD_ADDR secret contains the correct URL (e.g., https://your-nomad-server:4646)"
+          echo "3. Network allows connections to the Nomad server"
+          echo "4. Nomad server is configured to accept external connections"
+          
+          # Try to get more details about the connection issue
+          echo ""
+          echo "Connection test results:"
+          timeout 10 curl -v "$NOMAD_ADDR/v1/status/leader" || echo "Direct curl test failed"
+          exit 1
+        fi
+        
+        echo "✅ Successfully connected to Nomad"
+        nomad status
+
+    - name: Prepare Nomad job file
+      run: |
+        # Create backup of original file
+        cp nomad/teams.hcl nomad/teams.hcl.backup
+        
+        # Replace placeholders with actual values
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/teams.hcl
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/teams.hcl
+        
+        echo "📝 Updated Nomad job file:"
+        echo "---"
+        head -20 nomad/teams.hcl
+        echo "---"
+        
+    - name: Validate Nomad job
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      run: |
+        echo "🔍 Validating Nomad job file..."
+        if nomad job validate nomad/teams.hcl; then
+          echo "✅ Nomad job file is valid"
+        else
+          echo "❌ Nomad job file validation failed"
+          echo "Job file content:"
+          cat nomad/teams.hcl
+          exit 1
+        fi
 
     - name: Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/teams.hcl
-        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/teams.hcl
-        nomad job run nomad/teams.hcl
-        timeout 300 bash -c 'until nomad job status teams-service | grep -q "Status.*running"; do echo "Waiting..."; sleep 10; done'
-        echo "✅ Teams service deployed!"
+        echo "🚀 Deploying Teams service to Nomad..."
+        
+        # Submit the job
+        if nomad job run nomad/teams.hcl; then
+          echo "✅ Job submitted successfully"
+        else
+          echo "❌ Job submission failed"
+          echo "Job status:"
+          nomad job status teams-service || echo "Cannot get job status"
+          exit 1
+        fi
+        
+    - name: Wait for deployment
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      run: |
+        echo "⏳ Waiting for deployment to complete..."
+        
+        # Wait for the job to be running
+        timeout 300 bash -c '
+          while true; do
+            STATUS=$(nomad job status teams-service 2>/dev/null | grep "Status" | awk "{print \$3}" || echo "unknown")
+            echo "Current status: $STATUS"
+            
+            if [ "$STATUS" = "running" ]; then
+              echo "✅ Service is running!"
+              break
+            elif [ "$STATUS" = "dead" ] || [ "$STATUS" = "failed" ]; then
+              echo "❌ Deployment failed with status: $STATUS"
+              echo "Job details:"
+              nomad job status teams-service
+              echo ""
+              echo "Recent events:"
+              nomad job history teams-service || echo "Cannot get job history"
+              exit 1
+            fi
+            
+            sleep 10
+          done
+        '
+        
+        echo "🎉 Teams service deployed successfully!"
+        
+    - name: Verify deployment
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      run: |
+        echo "🔍 Verifying deployment..."
+        
+        # Get job status
+        nomad job status teams-service
+        
+        echo ""
+        echo "📊 Service allocation details:"
+        nomad job allocs teams-service | head -10
+        
+        # Try to get service endpoint info from Consul if available
+        echo ""
+        echo "🔗 Service should be available at port 5005"
+        echo "✅ Deployment verification complete"
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && needs.deploy.result == 'failure'
+    
+    steps:
+    - name: Cleanup on failure
+      env:
+        NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+        NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      run: |
+        echo "🧹 Cleaning up failed deployment..."
+        
+        # Install Nomad
+        NOMAD_VERSION="1.8.3"
+        curl -fsSL https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_amd64.zip -o nomad.zip
+        sudo unzip nomad.zip -d /usr/local/bin/
+        sudo chmod +x /usr/local/bin/nomad
+        rm nomad.zip
+        
+        # Stop the job if it exists but failed
+        if nomad job status teams-service >/dev/null 2>&1; then
+          echo "Stopping failed job..."
+          nomad job stop teams-service || echo "Could not stop job"
+        fi
+        
+        echo "Cleanup completed"
