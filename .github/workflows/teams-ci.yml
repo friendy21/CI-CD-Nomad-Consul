@@ -1,25 +1,19 @@
-name: CI/CD for User Service
+name: CI/CD for Teams Service
 
 on:
   push:
     branches: [ "main" ]
     paths:
-      - "user/**"
-      - ".github/workflows/user-ci.yml"
-      - "nomad/user.hcl"
+      - "teams/**"
+      - ".github/workflows/teams-ci.yml"
+      - "nomad/teams.hcl"
       - "docker/Dockerfile.stage"
-  pull_request:
-    branches: [ "main" ]
-    paths:
-      - "user/**"
-      - ".github/workflows/user-ci.yml"
-      - "nomad/user.hcl"
 
 env:
   IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
-  DOCKER_IMAGE: friendy21/user-service
-  SERVICE_NAME: user-service
-  SERVICE_PORT: 5001
+  DOCKER_IMAGE: friendy21/teams-service
+  SERVICE_NAME: teams-service
+  SERVICE_PORT: 5005
 
 permissions:
   contents: read
@@ -42,36 +36,17 @@ jobs:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
         
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ${{ env.DOCKER_IMAGE }}
-        tags: |
-          type=ref,event=branch
-          type=sha,prefix={{branch}}-
-          type=raw,value=latest,enable={{is_default_branch}}
-        
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
       with:
-        context: ./user
+        context: ./teams
         file: ./docker/Dockerfile.stage
         push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
+        tags: |
+          ${{ env.DOCKER_IMAGE }}:latest
+          ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
-        build-args: |
-          BUILD_DATE=${{ github.event.head_commit.timestamp }}
-          VERSION=${{ env.IMAGE_TAG }}
-
-    - name: Run security scan
-      uses: aquasecurity/trivy-action@master
-      with:
-        image-ref: ${{ env.DOCKER_IMAGE }}:latest
-        format: 'table'
-        exit-code: '0'
 
   deploy:
     runs-on: ubuntu-latest
@@ -103,6 +78,7 @@ jobs:
         rm -f nomad.zip LICENSE.txt
         
         # Verify installation
+        which nomad
         nomad version
 
     - name: Deploy to Nomad
@@ -110,34 +86,44 @@ jobs:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/user.hcl
-        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/user.hcl
+        # Replace placeholders
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/teams.hcl
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/teams.hcl
         
         # Validate job
-        nomad job validate nomad/user.hcl
+        if ! nomad job validate nomad/teams.hcl; then
+          echo "❌ Job validation failed"
+          cat nomad/teams.hcl
+          exit 1
+        fi
         
-        # Deploy job
-        nomad job run nomad/user.hcl
+        # Run the job
+        echo "🚀 Deploying teams-service..."
+        nomad job run nomad/teams.hcl
         
         # Wait for deployment
+        echo "⏳ Waiting for deployment..."
         MAX_ATTEMPTS=30
         ATTEMPT=0
         
-        echo "⏳ Waiting for deployment to complete..."
         while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          if nomad job status user-service 2>/dev/null | grep -q "Status.*running"; then
-            echo "✅ User service is running!"
-            break
+          STATUS=$(nomad job status teams-service 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "pending")
+          echo "Status check $((ATTEMPT + 1))/$MAX_ATTEMPTS: $STATUS"
+          
+          if [ "$STATUS" = "running" ]; then
+            echo "✅ Teams service is running!"
+            nomad job status teams-service
+            exit 0
+          elif [ "$STATUS" = "dead" ] || [ "$STATUS" = "failed" ]; then
+            echo "❌ Deployment failed with status: $STATUS"
+            nomad job status teams-service
+            exit 1
           fi
+          
           sleep 10
           ATTEMPT=$((ATTEMPT + 1))
         done
         
-        if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-          echo "❌ Deployment timed out"
-          nomad job status user-service
-          exit 1
-        fi
-        
-        echo "✅ User service deployed successfully!"
-        nomad job status user-service
+        echo "❌ Deployment timed out after $((MAX_ATTEMPTS * 10)) seconds"
+        nomad job status teams-service || true
+        exit 1
