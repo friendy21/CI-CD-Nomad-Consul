@@ -1,0 +1,19 @@
+{
+  "service": {
+    "name": "teams-service",
+    "port": 5005,
+    "tags": ["api", "backend", "v1"],
+    "meta": {
+      "version": "1.0.0",
+      "protocol": "http"
+    },
+    "check": {
+      "id": "teams-service-health",
+      "name": "Teams Service Health Check",
+      "http": "http://localhost:5005/health",
+      "method": "GET",
+      "interval": "30s",
+      "timeout": "5s"
+    }
+  }
+}
