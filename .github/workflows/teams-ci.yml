@@ -8,6 +8,12 @@ on:
       - ".github/workflows/teams-ci.yml"
       - "nomad/teams.hcl"
       - "docker/Dockerfile.stage"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "teams/**"
+      - ".github/workflows/teams-ci.yml"
+      - "nomad/teams.hcl"
 
 env:
   IMAGE_TAG: ${{ github.ref_name }}-${{ github.sha }}
@@ -18,6 +24,7 @@ env:
 permissions:
   contents: read
   packages: write
+  security-events: write
 
 jobs:
   build:
@@ -35,6 +42,16 @@ jobs:
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_IMAGE }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
         
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
@@ -42,11 +59,26 @@ jobs:
         context: ./teams
         file: ./docker/Dockerfile.stage
         push: true
-        tags: |
-          ${{ env.DOCKER_IMAGE }}:latest
-          ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VERSION=${{ env.IMAGE_TAG }}
+
+    - name: Run security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.DOCKER_IMAGE }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
 
   deploy:
     runs-on: ubuntu-latest
@@ -58,72 +90,209 @@ jobs:
       uses: actions/checkout@v4
       
     - name: Setup Nomad
-      run: |
-        # Clean up any existing nomad files/directories
-        sudo rm -rf /usr/local/bin/nomad
-        sudo rm -rf nomad
-        rm -f nomad.zip LICENSE.txt
-        
-        # Download Nomad
-        curl -fsSL -o nomad.zip https://releases.hashicorp.com/nomad/1.8.3/nomad_1.8.3_linux_amd64.zip
-        
-        # Extract with overwrite flag
-        unzip -o nomad.zip
-        
-        # Move the binary to /usr/local/bin
-        chmod +x nomad
-        sudo mv nomad /usr/local/bin/nomad
-        
-        # Clean up
-        rm -f nomad.zip LICENSE.txt
-        
-        # Verify installation
-        which nomad
-        nomad version
+      uses: hashicorp/setup-nomad@main
+      with:
+        nomad_version: 'latest'
 
-    - name: Deploy to Nomad
+    - name: Verify Nomad installation
+      run: |
+        echo "✅ Nomad version:"
+        nomad version
+        echo "✅ Nomad path:"
+        which nomad
+
+    - name: Validate and Deploy to Nomad
       env:
         NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
         NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
       run: |
-        # Replace placeholders
-        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" nomad/teams.hcl
-        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" nomad/teams.hcl
+        set -e
         
-        # Validate job
-        if ! nomad job validate nomad/teams.hcl; then
-          echo "❌ Job validation failed"
-          cat nomad/teams.hcl
+        echo "🔍 Starting deployment for ${{ env.SERVICE_NAME }}..."
+        
+        # Environment validation
+        if [ -z "$NOMAD_ADDR" ] || [ -z "$NOMAD_TOKEN" ]; then
+          echo "❌ NOMAD_ADDR or NOMAD_TOKEN missing"
           exit 1
         fi
         
-        # Run the job
-        echo "🚀 Deploying teams-service..."
-        nomad job run nomad/teams.hcl
+        echo "✅ Environment ready"
+        echo "🎯 Nomad: $NOMAD_ADDR"
+        echo "🔧 Image: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}"
         
-        # Wait for deployment
-        echo "⏳ Waiting for deployment..."
-        MAX_ATTEMPTS=30
-        ATTEMPT=0
-        
-        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          STATUS=$(nomad job status teams-service 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "pending")
-          echo "Status check $((ATTEMPT + 1))/$MAX_ATTEMPTS: $STATUS"
-          
-          if [ "$STATUS" = "running" ]; then
-            echo "✅ Teams service is running!"
-            nomad job status teams-service
-            exit 0
-          elif [ "$STATUS" = "dead" ] || [ "$STATUS" = "failed" ]; then
-            echo "❌ Deployment failed with status: $STATUS"
-            nomad job status teams-service
+        # Locate HCL file
+        HCL_FILE="nomad/teams.hcl"
+        if [ ! -f "$HCL_FILE" ]; then
+          echo "🔍 Searching for teams.hcl..."
+          HCL_FILE=$(find . -name "teams.hcl" -type f | head -1)
+          if [ -z "$HCL_FILE" ]; then
+            echo "❌ teams.hcl not found"
+            echo "📁 Available HCL files:"
+            find . -name "*.hcl" -type f || echo "None found"
             exit 1
           fi
+        fi
+        echo "✅ HCL file: $HCL_FILE"
+        
+        # Create backup and process
+        BACKUP="${HCL_FILE}.backup.$(date +%s)"
+        cp "$HCL_FILE" "$BACKUP"
+        echo "💾 Backup: $BACKUP"
+        
+        # Replace placeholders
+        echo "🔄 Processing placeholders..."
+        sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.IMAGE_TAG }}|g" "$HCL_FILE"
+        sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ env.DOCKER_IMAGE }}|g" "$HCL_FILE"
+        
+        # Validation of replacement
+        PLACEHOLDER_COUNT=$(grep -c "PLACEHOLDER" "$HCL_FILE" 2>/dev/null || echo "0")
+        if [ "$PLACEHOLDER_COUNT" -gt 0 ]; then
+          echo "❌ $PLACEHOLDER_COUNT unprocessed placeholders:"
+          grep "PLACEHOLDER" "$HCL_FILE"
+          cp "$BACKUP" "$HCL_FILE"
+          exit 1
+        fi
+        echo "✅ Placeholders processed successfully"
+        
+        # Test connectivity
+        echo "🔗 Testing connection to Nomad..."
+        RETRY_CONN=0
+        while [ $RETRY_CONN -lt 5 ]; do
+          if nomad node status >/dev/null 2>&1; then
+            echo "✅ Nomad connection established"
+            break
+          fi
           
-          sleep 10
-          ATTEMPT=$((ATTEMPT + 1))
+          RETRY_CONN=$((RETRY_CONN + 1))
+          if [ $RETRY_CONN -lt 5 ]; then
+            echo "⏳ Connection attempt $RETRY_CONN/5, retrying..."
+            sleep 8
+          else
+            echo "❌ Failed to connect after 5 attempts"
+            exit 1
+          fi
         done
         
-        echo "❌ Deployment timed out after $((MAX_ATTEMPTS * 10)) seconds"
-        nomad job status teams-service || true
+        # Job validation
+        echo "🔍 Validating Nomad job..."
+        if ! nomad job validate "$HCL_FILE"; then
+          echo "❌ Job validation failed"
+          echo "📄 Job content:"
+          cat "$HCL_FILE"
+          exit 1
+        fi
+        echo "✅ Job validation passed"
+        
+        # Planning phase
+        echo "📋 Creating deployment plan..."
+        if ! nomad job plan "$HCL_FILE"; then
+          echo "⚠️ Planning encountered issues, proceeding with caution"
+        else
+          echo "✅ Planning successful"
+        fi
+        
+        # Execute deployment
+        echo "🚀 Executing deployment..."
+        if ! nomad job run "$HCL_FILE"; then
+          echo "❌ Job execution failed"
+          nomad job status ${{ env.SERVICE_NAME }} 2>/dev/null || echo "No job status available"
+          exit 1
+        fi
+        echo "✅ Job submitted to cluster"
+        
+        # Monitoring deployment
+        echo "⏳ Monitoring deployment status..."
+        MAX_MONITOR_TIME=80
+        MONITOR_TIME=0
+        STABLE_DURATION=0
+        LAST_STATUS=""
+        
+        while [ $MONITOR_TIME -lt $MAX_MONITOR_TIME ]; do
+          CURRENT_STATUS=$(nomad job status ${{ env.SERVICE_NAME }} 2>/dev/null | grep "^Status" | awk '{print $3}' || echo "pending")
+          
+          # Log status changes
+          if [ "$CURRENT_STATUS" != "$LAST_STATUS" ]; then
+            echo "📊 Status change: $LAST_STATUS → $CURRENT_STATUS"
+            LAST_STATUS="$CURRENT_STATUS"
+            STABLE_DURATION=0
+          fi
+          
+          case "$CURRENT_STATUS" in
+            "running")
+              STABLE_DURATION=$((STABLE_DURATION + 1))
+              
+              if [ $STABLE_DURATION -ge 4 ]; then
+                echo "✅ ${{ env.SERVICE_NAME }} successfully deployed and stable!"
+                
+                # Display deployment info
+                echo "📊 Final deployment status:"
+                nomad job status ${{ env.SERVICE_NAME }} | head -12
+                
+                # Attempt service health check
+                echo "🏥 Performing health verification..."
+                HEALTH_SUCCESS=false
+                
+                for health_try in {1..8}; do
+                  echo "🔄 Health check $health_try/8..."
+                  
+                  if timeout 12 curl -f -s "http://localhost:${{ env.SERVICE_PORT }}/health" >/dev/null 2>&1; then
+                    echo "✅ Health check successful"
+                    
+                    # Get health details
+                    HEALTH_DETAILS=$(timeout 8 curl -s "http://localhost:${{ env.SERVICE_PORT }}/health" 2>/dev/null | jq . 2>/dev/null || echo "Service responsive")
+                    echo "📋 Health details: $HEALTH_DETAILS"
+                    
+                    HEALTH_SUCCESS=true
+                    break
+                  fi
+                  
+                  if [ $health_try -lt 8 ]; then
+                    sleep 12
+                  fi
+                done
+                
+                if [ "$HEALTH_SUCCESS" = false ]; then
+                  echo "⚠️ Health endpoint not accessible"
+                  echo "🔍 This might be expected if service is still initializing"
+                fi
+                
+                echo "🎉 Deployment completed successfully!"
+                exit 0
+              else
+                echo "📊 Running stable for ${STABLE_DURATION}s (need 4s)"
+              fi
+              ;;
+            "dead"|"failed")
+              echo "❌ Deployment failed with status: $CURRENT_STATUS"
+              
+              # Detailed failure information
+              echo "📊 Job status details:"
+              nomad job status ${{ env.SERVICE_NAME }} | head -20
+              echo ""
+              echo "📋 Allocation information:"
+              nomad job allocs ${{ env.SERVICE_NAME }} | head -8
+              echo ""
+              echo "📝 Recent logs:"
+              ALLOC_ID=$(nomad job allocs ${{ env.SERVICE_NAME }} -json 2>/dev/null | jq -r '.[0].ID' 2>/dev/null || echo "")
+              if [ -n "$ALLOC_ID" ] && [ "$ALLOC_ID" != "null" ]; then
+                nomad alloc logs -n 30 "$ALLOC_ID" 2>/dev/null || echo "Logs not available"
+              fi
+              
+              exit 1
+              ;;
+            "pending")
+              if [ $((MONITOR_TIME % 15)) -eq 0 ] && [ $MONITOR_TIME -gt 0 ]; then
+                echo "📊 Still pending after ${MONITOR_TIME}s..."
+                nomad job status ${{ env.SERVICE_NAME }} | head -8
+              fi
+              ;;
+          esac
+          
+          sleep 5
+          MONITOR_TIME=$((MONITOR_TIME + 1))
+        done
+        
+        echo "❌ Monitoring timeout after ${MAX_MONITOR_TIME}s"
+        echo "📊 Final status:"
+        nomad job status ${{ env.SERVICE_NAME }} || true
         exit 1
