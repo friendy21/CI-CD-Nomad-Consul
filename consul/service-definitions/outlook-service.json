@@ -1,0 +1,19 @@
+{
+  "service": {
+    "name": "outlook-service",
+    "port": 5004,
+    "tags": ["api", "backend", "v1"],
+    "meta": {
+      "version": "1.0.0",
+      "protocol": "http"
+    },
+    "check": {
+      "id": "outlook-service-health",
+      "name": "Outlook Service Health Check",
+      "http": "http://localhost:5004/health",
+      "method": "GET",
+      "interval": "30s",
+      "timeout": "5s"
+    }
+  }
+}
